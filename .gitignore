@@ -1,0 +1,25 @@
+# Byte-compiled / cache
+__pycache__/
+*.pyc
+
+# Results and plots
+result_plots/
+results/
+*.png
+*.pdf
+
+# NumPy / binary outputs
+*.npy
+*.npz
+
+# Environments
+env/
+venv/
+.env
+
+# Editor configs
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
