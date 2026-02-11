@@ -140,6 +140,9 @@ class RNNSystemAnalyzer:
         x_tensor = self._get_scaled_input(raw_input_val)
         h_shape = (self.num_layers * self.num_directions, 1, self.hidden_dim)
 
+        # Enable training mode for cudnn backward pass
+        self.cell.train()
+
         found_fps = []
         found_losses = []
 
@@ -186,6 +189,10 @@ class RNNSystemAnalyzer:
 
         print(f"Found {len(unique_fps)} unique fixed point(s) "
               f"(from {len(found_fps)} converged / {n_restarts} restarts)")
+
+        # Restore eval mode
+        self.cell.eval()
+
         return unique_fps
 
     # ------------------------------------------------------------------
@@ -214,6 +221,9 @@ class RNNSystemAnalyzer:
             h_fp.flatten(), dtype=torch.float32, device=self.device
         )
 
+        # Enable training mode for Jacobian backward pass
+        self.cell.train()
+
         def mapping(hf):
             h = hf.reshape(
                 self.num_layers * self.num_directions, 1, self.hidden_dim
@@ -223,6 +233,10 @@ class RNNSystemAnalyzer:
 
         J = torch.autograd.functional.jacobian(mapping, h_flat)
         J_np = J.detach().cpu().numpy()
+
+        # Restore eval mode
+        self.cell.eval()
+
         return np.linalg.eigvals(J_np)
 
     # ------------------------------------------------------------------
@@ -345,8 +359,8 @@ class RNNSystemAnalyzer:
 
         # --- Flow field via batched RNN step ---
         margin = 0.15
-        xr = traj_pc[:, 0].ptp() or 1.0
-        yr = traj_pc[:, 1].ptp() or 1.0
+        xr = np.ptp(traj_pc[:, 0]) or 1.0
+        yr = np.ptp(traj_pc[:, 1]) or 1.0
         x_lo, x_hi = traj_pc[:, 0].min() - margin * xr, traj_pc[:, 0].max() + margin * xr
         y_lo, y_hi = traj_pc[:, 1].min() - margin * yr, traj_pc[:, 1].max() + margin * yr
 
