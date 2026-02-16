@@ -32,7 +32,6 @@ class RNNSystemAnalyzer:
         self.model = rnn_regressor.model
         self.device = rnn_regressor.device
         self.hidden_dim = rnn_regressor.hidden_dim
-        self.num_layers = rnn_regressor.num_layers
 
         # Warnings for non-Markovian architectures
         if getattr(rnn_regressor, 'bidirectional', False):
@@ -48,16 +47,25 @@ class RNNSystemAnalyzer:
         if hasattr(self.model, 'gru'):
             self.cell = self.model.gru
             self.cell_type = 'gru'
+            self.num_directions = (
+                2 if getattr(self.cell, 'bidirectional', False) else 1
+            )
+            self.num_layers = getattr(rnn_regressor, 'num_layers', 1)
         elif hasattr(self.model, 'rnn'):
             self.cell = self.model.rnn
             self.cell_type = 'rnn'
+            self.num_directions = (
+                2 if getattr(self.cell, 'bidirectional', False) else 1
+            )
+            self.num_layers = getattr(rnn_regressor, 'num_layers', 1)
+        elif hasattr(self.model, 'W_rec'):  # ContinuousRNNNetwork
+            self.cell = self.model
+            self.cell_type = 'continuous'
+            self.num_directions = 1
+            self.num_layers = 1  # Continuous RNN is single-layer by design
         else:
             raise ValueError("Model architecture not recognised: expected a "
-                             "'gru' or 'rnn' attribute on the network.")
-
-        self.num_directions = (
-            2 if getattr(self.cell, 'bidirectional', False) else 1
-        )
+                             "'gru', 'rnn', or continuous RNN attribute on the network.")
 
         # Normalisation statistics (numpy arrays, shape (1, 1, n_features))
         self.X_mean = rnn_regressor.X_mean
@@ -99,14 +107,33 @@ class RNNSystemAnalyzer:
         Parameters
         ----------
         h : Tensor, shape ``(num_layers*num_directions, 1, hidden_dim)``
+            or ``(1, hidden_dim)`` for continuous RNN
         x_tensor : Tensor, shape ``(1, 1, input_size)``
 
         Returns
         -------
         Tensor  — new hidden state, same shape as *h*.
         """
-        _, h_new = self.cell(x_tensor, h)
-        return h_new
+        if self.cell_type == 'continuous':
+            # Continuous RNN: h is (1, hidden_dim), x is (1, 1, input_size)
+            # Need to extract input and compute one step manually
+            x_t = x_tensor.squeeze(1)  # (1, input_size)
+            h_flat = h.squeeze(0)  # (hidden_dim,) or (1, hidden_dim)
+            if h_flat.dim() == 1:
+                h_flat = h_flat.unsqueeze(0)  # (1, hidden_dim)
+
+            # Compute one step: h[t+1] = (1-alpha)*h[t] + alpha*(g*phi(W_rec@h[t]) + W_in@x[t] + b)
+            rec_drive = self.cell.g * self.cell.W_rec(self.cell.phi(h_flat))
+            inp_drive = self.cell.W_in(x_t)
+            drive = rec_drive + inp_drive + self.cell.bias
+            h_new = (1 - self.cell.alpha) * h_flat + self.cell.alpha * drive
+
+            # Return as (1, hidden_dim) to match input shape
+            return h_new
+        else:
+            # Standard GRU/RNN/LSTM
+            _, h_new = self.cell(x_tensor, h)
+            return h_new
 
     # ------------------------------------------------------------------
     # Fixed-point search
@@ -138,7 +165,12 @@ class RNNSystemAnalyzer:
             ``(num_layers * num_directions, hidden_dim)``.
         """
         x_tensor = self._get_scaled_input(raw_input_val)
-        h_shape = (self.num_layers * self.num_directions, 1, self.hidden_dim)
+
+        # Set hidden state shape based on cell type
+        if self.cell_type == 'continuous':
+            h_shape = (1, self.hidden_dim)
+        else:
+            h_shape = (self.num_layers * self.num_directions, 1, self.hidden_dim)
 
         # Enable training mode for cudnn backward pass
         self.cell.train()
@@ -216,7 +248,14 @@ class RNNSystemAnalyzer:
             ``h_fp``.
         """
         x_tensor = self._get_scaled_input(raw_input_val)
-        total_dim = self.num_layers * self.num_directions * self.hidden_dim
+
+        if self.cell_type == 'continuous':
+            total_dim = self.hidden_dim
+            h_shape = (1, self.hidden_dim)
+        else:
+            total_dim = self.num_layers * self.num_directions * self.hidden_dim
+            h_shape = (self.num_layers * self.num_directions, 1, self.hidden_dim)
+
         h_flat = torch.tensor(
             h_fp.flatten(), dtype=torch.float32, device=self.device
         )
@@ -225,9 +264,7 @@ class RNNSystemAnalyzer:
         self.cell.train()
 
         def mapping(hf):
-            h = hf.reshape(
-                self.num_layers * self.num_directions, 1, self.hidden_dim
-            )
+            h = hf.reshape(h_shape)
             h_new = self._step_torch(h, x_tensor)
             return h_new.reshape(-1)
 
@@ -301,17 +338,25 @@ class RNNSystemAnalyzer:
             scaled, dtype=torch.float32, device=self.device
         ).unsqueeze(0)  # (1, seq_len, n_features)
 
-        h = torch.zeros(
-            self.num_layers * self.num_directions, 1, self.hidden_dim,
-            device=self.device,
-        )
+        if self.cell_type == 'continuous':
+            h = torch.zeros(1, self.hidden_dim, device=self.device)
+        else:
+            h = torch.zeros(
+                self.num_layers * self.num_directions, 1, self.hidden_dim,
+                device=self.device,
+            )
 
         hidden_states = []
         with torch.no_grad():
             for t in range(seq_len):
                 x_t = x_tensor[:, t : t + 1, :]  # (1, 1, n_features)
-                _, h = self.cell(x_t, h)
-                hidden_states.append(h[-1, 0, :].cpu().numpy())
+
+                if self.cell_type == 'continuous':
+                    h = self._step_torch(h, x_t)
+                    hidden_states.append(h[0, :].cpu().numpy())
+                else:
+                    _, h = self.cell(x_t, h)
+                    hidden_states.append(h[-1, 0, :].cpu().numpy())
 
         return np.array(hidden_states)
 
@@ -372,20 +417,37 @@ class RNNSystemAnalyzer:
         h_hd = pca.inverse_transform(pc_pts)  # (N, hidden_dim)
 
         N = grid_n * grid_n
-        h_batch = torch.zeros(
-            self.num_layers * self.num_directions, N, self.hidden_dim,
-            device=self.device,
-        )
-        h_batch[-1] = torch.tensor(h_hd, dtype=torch.float32,
-                                   device=self.device)
-
         x_tensor = self._get_scaled_input(raw_input_val)
-        x_batch = x_tensor.expand(N, -1, -1)  # (N, 1, input_size)
 
-        with torch.no_grad():
-            _, h_new_batch = self.cell(x_batch, h_batch)
+        if self.cell_type == 'continuous':
+            # For continuous RNN: h is (batch, hidden_dim)
+            h_batch = torch.tensor(h_hd, dtype=torch.float32, device=self.device)  # (N, hidden_dim)
+            x_batch = x_tensor.expand(N, -1, -1)  # (N, 1, input_size)
 
-        h_new_last = h_new_batch[-1].cpu().numpy()  # (N, hidden_dim)
+            with torch.no_grad():
+                # Compute flow field for each point
+                h_new_list = []
+                for i in range(N):
+                    h_i = h_batch[i:i+1]  # (1, hidden_dim)
+                    x_i = x_batch[i:i+1]  # (1, 1, input_size)
+                    h_new_i = self._step_torch(h_i, x_i)
+                    h_new_list.append(h_new_i)
+                h_new_batch = torch.cat(h_new_list, dim=0)  # (N, hidden_dim)
+
+            h_new_last = h_new_batch.cpu().numpy()  # (N, hidden_dim)
+        else:
+            # For standard RNN: h is (num_layers*num_directions, batch, hidden_dim)
+            h_batch = torch.zeros(
+                self.num_layers * self.num_directions, N, self.hidden_dim,
+                device=self.device,
+            )
+            h_batch[-1] = torch.tensor(h_hd, dtype=torch.float32, device=self.device)
+            x_batch = x_tensor.expand(N, -1, -1)  # (N, 1, input_size)
+
+            with torch.no_grad():
+                _, h_new_batch = self.cell(x_batch, h_batch)
+
+            h_new_last = h_new_batch[-1].cpu().numpy()  # (N, hidden_dim)
         h_new_pc = pca.transform(h_new_last)
 
         flow = h_new_pc - pc_pts

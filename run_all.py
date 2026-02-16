@@ -3,7 +3,7 @@ run_all.py - Integrated GLM fitting and RNN training pipeline
 
 This script:
 1. Fits GLM to Izhikevich neuron data
-2. Trains three RNN models (GRU, Vanilla RNN, LSTM) on trial-based data
+2. Trains four RNN models (GRU, Vanilla RNN, LSTM, CTRNN) on trial-based data
 3. Trains extended RNN variants with smoothing and history features
 4. Evaluates ALL models on the EXACT same stimulus
 5. Creates integrated comparison plots
@@ -26,7 +26,7 @@ from generate_izhikevich_stim import generate_izhikevich_stim
 from simulate_izhikevich import simulate_izhikevich
 from fit_glm import fit_glm
 from simulate_glm import simulate_glm
-from rnn_models import TorchRNNRegressor, TorchVanillaRNNRegressor, TorchLSTMRegressor
+from rnn_models import TorchRNNRegressor, TorchVanillaRNNRegressor, TorchLSTMRegressor, TorchContinuousRNNRegressor
 from rnn_data_generator import RNNDataGenerator
 from izhikevich_configs import cids, index_to_name
 
@@ -169,10 +169,10 @@ def plot_smoothed_training_data(X, y_smoothed, save_path, n_examples=5,
 
 
 def plot_training_losses(train_losses_dict, save_path):
-    """Plot training losses for base RNN models only."""
+    """Plot training losses for base RNN models."""
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    colors = {'GRU': 'tab:blue', 'Vanilla RNN': 'tab:orange', 'LSTM': 'tab:green'}
+    colors = {'GRU': 'tab:blue', 'Vanilla RNN': 'tab:orange', 'LSTM': 'tab:green', 'CTRNN': 'tab:purple'}
 
     for model_name, losses in train_losses_dict.items():
         epochs = np.arange(1, len(losses) + 1)
@@ -326,9 +326,10 @@ def plot_spike_raster_comparison(
         'GRU': 'tab:blue',
         'Vanilla RNN': 'tab:orange',
         'LSTM': 'tab:green',
+        'CTRNN': 'tab:purple',
         # Advanced GRU models (different shades of blue/purple)
         'GRU_Derivative': 'tab:cyan',
-        'GRU_Weighted': 'tab:purple',
+        'GRU_Weighted': 'darkviolet',
         'GRU_ClosedLoop': 'tab:pink',
         'BiGRU': 'darkblue',
         'GRU_Attention': 'mediumvioletred',
@@ -382,7 +383,7 @@ def plot_comparison(
     Shows:
     - Left: Time series (stimulus, voltage, filter outputs, conditional intensity, spike rasters)
     - Right: Filters (k, h)
-    - Spike rasters include: Izhikevich, 5 GLM runs, 3 RNN models (base only)
+    - Spike rasters include: Izhikevich, 5 GLM runs, 4 RNN models (base only)
     """
     # Time windows for each cell type
     Ts = np.array([
@@ -415,7 +416,7 @@ def plot_comparison(
     axisWidth = 1
     izColor = 'k'
     glmColor = [0.5, 0.5, 0.5]
-    rnnColors = {'GRU': 'tab:blue', 'Vanilla RNN': 'tab:orange', 'LSTM': 'tab:green'}
+    rnnColors = {'GRU': 'tab:blue', 'Vanilla RNN': 'tab:orange', 'LSTM': 'tab:green', 'CTRNN': 'tab:purple'}
 
     cell_name = index_to_name.get(cell_type, f"Cell {cell_type}")
     fig = plt.figure(figsize=(12, 14))
@@ -560,7 +561,7 @@ def plot_comparison(
     maxT_bin = int(maxT / rnn_bin_size_ms)
     rnn_tIdx = np.arange(minT_bin, min(maxT_bin + 1, len(list(rnn_predictions_binned.values())[0])))
 
-    for model_name in ['GRU', 'Vanilla RNN', 'LSTM']:
+    for model_name in ['GRU', 'Vanilla RNN', 'LSTM', 'CTRNN']:
         if model_name in rnn_predictions_binned:
             pred = rnn_predictions_binned[model_name]
             # Sample spikes from Poisson
@@ -597,6 +598,7 @@ def plot_comparison(
     from matplotlib.lines import Line2D
     legend_elements = [
         Line2D([0], [0], color=izColor, linewidth=2, label='Izhikevich'),
+        Line2D([0], [0], color=rnnColors['CTRNN'], linewidth=2, label='CTRNN'),
         Line2D([0], [0], color=rnnColors['LSTM'], linewidth=2, label='LSTM'),
         Line2D([0], [0], color=rnnColors['Vanilla RNN'], linewidth=2, label='Vanilla RNN'),
         Line2D([0], [0], color=rnnColors['GRU'], linewidth=2, label='GRU'),
@@ -630,7 +632,7 @@ def train_base_rnn_models(
     verbose: bool = True
 ) -> Dict[str, object]:
     """
-    Train the three base RNN models (GRU, Vanilla RNN, LSTM).
+    Train the four base RNN models (GRU, Vanilla RNN, LSTM, CTRNN).
 
     Args:
         X_train: Input sequences (n_trials, seq_len, n_features)
@@ -662,6 +664,13 @@ def train_base_rnn_models(
                                batch_size=32, learning_rate=0.001, verbose=verbose)
     lstm.fit(X_train, y_train)
     rnn_models['LSTM'] = lstm
+
+    if verbose:
+        print("\n  Training Continuous RNN...")
+    ctrnn = TorchContinuousRNNRegressor(hidden_dim=RNN_HIDDEN_DIM, n_epochs=RNN_N_EPOCHS,
+                                        batch_size=32, learning_rate=0.001, verbose=verbose)
+    ctrnn.fit(X_train, y_train)
+    rnn_models['CTRNN'] = ctrnn
 
     return rnn_models
 

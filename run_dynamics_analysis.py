@@ -31,7 +31,10 @@ if _HERE not in sys.path:
 from generate_izhikevich_stim import generate_izhikevich_stim
 from simulate_izhikevich import simulate_izhikevich
 from rnn_data_generator import RNNDataGenerator
-from rnn_models import TorchRNNRegressor
+from rnn_models import (
+    TorchRNNRegressor, TorchVanillaRNNRegressor,
+    TorchLSTMRegressor, TorchContinuousRNNRegressor
+)
 from rnn_dynamics import RNNSystemAnalyzer
 from izhikevich_configs import cids, index_to_name
 
@@ -62,7 +65,7 @@ NEURON_TYPES = {
 
 def analyze_cell_type(cell_type, n_trials=1000, hidden_dim=64, n_epochs=5,
                       batch_size=32, bin_size_ms=1.0, trial_duration_ms=250.0,
-                      seed=42, fp_restarts=50):
+                      seed=42, fp_restarts=50, model_name='GRU'):
     """Run dynamics analysis for a single cell type.
 
     Parameters
@@ -72,7 +75,7 @@ def analyze_cell_type(cell_type, n_trials=1000, hidden_dim=64, n_epochs=5,
     n_trials : int
         Number of RNN training trials.
     hidden_dim : int
-        GRU hidden state dimension.
+        RNN hidden state dimension.
     n_epochs : int
         Training epochs.
     batch_size : int
@@ -85,6 +88,8 @@ def analyze_cell_type(cell_type, n_trials=1000, hidden_dim=64, n_epochs=5,
         Random seed.
     fp_restarts : int
         Number of fixed-point search restarts.
+    model_name : str
+        RNN model type ('GRU', 'Vanilla RNN', 'LSTM', 'CTRNN').
 
     Returns
     -------
@@ -130,15 +135,44 @@ def analyze_cell_type(cell_type, n_trials=1000, hidden_dim=64, n_epochs=5,
     print(f"    X_train : {X_train.shape}")
     print(f"    y_train : {y_train.shape}")
 
-    # ---- 3. Train GRU ----
-    print("\n[3] Training GRU model ...")
-    model = TorchRNNRegressor(
-        hidden_dim=hidden_dim,
-        num_layers=1,
-        n_epochs=n_epochs,
-        batch_size=batch_size,
-        verbose=False,
-    )
+    # ---- 3. Train RNN model ----
+    print(f"\n[3] Training {model_name} model ...")
+
+    # Factory pattern to select model
+    if model_name == 'GRU':
+        model = TorchRNNRegressor(
+            hidden_dim=hidden_dim,
+            num_layers=1,
+            n_epochs=n_epochs,
+            batch_size=batch_size,
+            verbose=False,
+        )
+    elif model_name == 'Vanilla RNN':
+        model = TorchVanillaRNNRegressor(
+            hidden_dim=hidden_dim,
+            num_layers=1,
+            n_epochs=n_epochs,
+            batch_size=batch_size,
+            verbose=False,
+        )
+    elif model_name == 'LSTM':
+        model = TorchLSTMRegressor(
+            hidden_dim=hidden_dim,
+            num_layers=1,
+            n_epochs=n_epochs,
+            batch_size=batch_size,
+            verbose=False,
+        )
+    elif model_name == 'CTRNN':
+        model = TorchContinuousRNNRegressor(
+            hidden_dim=hidden_dim,
+            n_epochs=n_epochs,
+            batch_size=batch_size,
+            verbose=False,
+        )
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
+
     model.fit(X_train, y_train)
     print(f"    Final training loss : {model.train_losses[-1]:.6f}")
 
@@ -317,6 +351,13 @@ Examples:
         default=50,
         help='Number of fixed-point search restarts (default: 50)'
     )
+    parser.add_argument(
+        '--model',
+        type=str,
+        default='GRU',
+        choices=['GRU', 'Vanilla RNN', 'LSTM', 'CTRNN'],
+        help='RNN model to use for dynamics analysis (default: GRU)'
+    )
 
     args = parser.parse_args()
 
@@ -339,6 +380,7 @@ Examples:
             trial_duration_ms=args.trial_duration_ms,
             seed=args.seed,
             fp_restarts=args.fp_restarts,
+            model_name=args.model,
         )
         if result is not None:
             results[ct] = result

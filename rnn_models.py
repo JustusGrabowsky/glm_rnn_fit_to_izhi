@@ -1,10 +1,11 @@
 """
 rnn_models.py - PyTorch RNN models for neural encoding
 
-Three RNN architectures for spike prediction:
+Four RNN architectures for spike prediction:
 - TorchRNNRegressor (GRU-based) - with optional bidirectional and attention
 - TorchVanillaRNNRegressor (Elman RNN)
 - TorchLSTMRegressor (LSTM-based)
+- TorchContinuousRNNRegressor (Continuous-time RNN)
 
 All models use:
 - sklearn-like API with fit() and predict_rate()
@@ -757,6 +758,318 @@ class TorchLSTMRegressor:
         return self
 
     def predict_rate(self, X: np.ndarray, return_sequence: bool = False) -> np.ndarray:
+        if not self._is_fitted:
+            raise RuntimeError("Model must be fitted before predicting")
+
+        if X.ndim == 2:
+            X = X[:, :, np.newaxis]
+
+        X_scaled = (X - self.X_mean) / (self.X_std + 1e-8)
+
+        self.model.eval()
+        X_tensor = torch.FloatTensor(X_scaled).to(self.device)
+
+        with torch.no_grad():
+            y_pred = self.model(X_tensor, return_sequence=return_sequence)
+
+        return y_pred.cpu().numpy()
+
+# =============================================================================
+# Continuous-time RNN Network (CTRNN)
+# =============================================================================
+
+class ContinuousRNNNetwork(nn.Module):
+    """
+    Continuous-time RNN with leaky integration dynamics.
+
+    Implements the equation:
+        h[t+1] = (1 - alpha) * h[t] + alpha * (g * phi(W_rec @ h[t]) + W_in @ x[t] + b)
+
+    Where:
+        - alpha = dt / tau (discrete timestep / time constant)
+        - phi is the nonlinearity (tanh)
+        - g is the recurrent gain/scaling parameter
+        - W_rec is the recurrent weight matrix
+        - W_in is the input weight matrix
+        - b is the bias
+
+    This formulation follows the DataConstrainedRNNs implementation for
+    continuous-time dynamics with leaky integration.
+    """
+
+    def __init__(
+        self,
+        input_size: int = 1,
+        hidden_size: int = 64,
+        dt: float = 0.1,
+        tau: float = 1.0,
+        g: float = 1.0,
+        nonlinearity: str = 'tanh',
+        init_scale: float = 1.0
+    ):
+        """
+        Initialize continuous-time RNN.
+
+        Args:
+            input_size: Dimension of input
+            hidden_size: Dimension of hidden state
+            dt: Discrete time bin size
+            tau: Time constant of the dynamics
+            g: Gain parameter for recurrent weights
+            nonlinearity: Activation function ('tanh' or 'relu')
+            init_scale: Scaling for weight initialization (typically g / sqrt(N))
+        """
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.alpha = dt / tau
+        self.g = g
+
+        # Nonlinearity
+        if nonlinearity == 'tanh':
+            self.phi = torch.tanh
+        elif nonlinearity == 'relu':
+            self.phi = torch.relu
+        else:
+            raise ValueError(f"Unsupported nonlinearity: {nonlinearity}")
+
+        # Input weights: (hidden_size, input_size)
+        self.W_in = nn.Linear(input_size, hidden_size, bias=False)
+
+        # Recurrent weights: (hidden_size, hidden_size) - no bias in recurrent
+        self.W_rec = nn.Linear(hidden_size, hidden_size, bias=False)
+
+        # Bias (applied after input)
+        self.bias = nn.Parameter(torch.zeros(hidden_size))
+
+        # Readout layer
+        self.fc = nn.Linear(hidden_size, 1)
+        self.softplus = nn.Softplus()
+
+        # Initialize weights with normal distribution scaled by init_scale
+        self._initialize_weights(init_scale)
+
+    def _initialize_weights(self, init_scale: float):
+        """
+        Initialize weights following DataConstrainedRNNs convention.
+
+        Recurrent weights are initialized as N(0, (g/sqrt(N))^2) to ensure
+        stable dynamics at initialization.
+        """
+        # Recurrent weights: scaled normal distribution
+        nn.init.normal_(self.W_rec.weight, mean=0.0, std=init_scale / np.sqrt(self.hidden_size))
+
+        # Input weights: smaller scale
+        nn.init.normal_(self.W_in.weight, mean=0.0, std=1.0 / np.sqrt(self.hidden_size))
+
+        # Readout weights: small random initialization
+        nn.init.normal_(self.fc.weight, mean=0.0, std=0.1)
+        nn.init.zeros_(self.fc.bias)
+
+    def forward(self, x: torch.Tensor, return_sequence: bool = False) -> torch.Tensor:
+        """
+        Forward pass through continuous-time RNN.
+
+        Args:
+            x: Input tensor (batch, seq_len, input_size)
+            return_sequence: If True, return predictions for all timesteps
+
+        Returns:
+            Predicted firing rates (batch,) or (batch, seq_len)
+        """
+        batch_size, seq_len, _ = x.shape
+
+        # Initialize hidden state to zeros
+        h = torch.zeros(batch_size, self.hidden_size, device=x.device)
+
+        # Store hidden states if returning sequence
+        if return_sequence:
+            h_sequence = []
+
+        # Unroll the RNN manually
+        for t in range(seq_len):
+            # Get input at time t
+            x_t = x[:, t, :]  # (batch, input_size)
+
+            # Compute drive term: g * phi(W_rec @ h[t-1]) + W_in @ x[t] + b
+            rec_drive = self.g * self.W_rec(self.phi(h))  # (batch, hidden_size)
+            inp_drive = self.W_in(x_t)  # (batch, hidden_size)
+            drive = rec_drive + inp_drive + self.bias
+
+            # Leaky integration: h[t] = (1 - alpha) * h[t-1] + alpha * drive
+            h = (1 - self.alpha) * h + self.alpha * drive
+
+            if return_sequence:
+                h_sequence.append(h)
+
+        # Compute output
+        if return_sequence:
+            h_all = torch.stack(h_sequence, dim=1)  # (batch, seq_len, hidden_size)
+            out = self.fc(h_all)  # (batch, seq_len, 1)
+            out = self.softplus(out)
+            return out.squeeze(-1)  # (batch, seq_len)
+        else:
+            out = self.fc(h)  # (batch, 1)
+            out = self.softplus(out)
+            return out.squeeze(-1)  # (batch,)
+
+
+class TorchContinuousRNNRegressor:
+    """
+    PyTorch Continuous-time RNN wrapper with sklearn-like API.
+
+    Implements a continuous-time RNN (CTRNN) with leaky integration dynamics,
+    following the formulation from the DataConstrainedRNNs repository.
+
+    The dynamics follow:
+        h[t+1] = (1 - alpha) * h[t] + alpha * (g * phi(W_rec @ h[t]) + W_in @ x[t] + b)
+
+    where alpha = dt / tau controls the timescale of integration.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 64,
+        dt: float = 0.1,
+        tau: float = 1.0,
+        g: float = 1.0,
+        nonlinearity: str = 'tanh',
+        learning_rate: float = 0.001,
+        n_epochs: int = 100,
+        batch_size: int = 64,
+        device: Optional[str] = None,
+        verbose: bool = True
+    ):
+        """
+        Initialize Continuous-time RNN regressor.
+
+        Args:
+            hidden_dim: Number of hidden units
+            dt: Discrete time bin size (in same units as tau)
+            tau: Time constant of the dynamics
+            g: Gain parameter for recurrent weights
+            nonlinearity: Activation function ('tanh' or 'relu')
+            learning_rate: Learning rate for Adam optimizer
+            n_epochs: Number of training epochs
+            batch_size: Batch size for training
+            device: Device to use ('cuda', 'mps', 'cpu', or None for auto)
+            verbose: Whether to print training progress
+        """
+        self.hidden_dim = hidden_dim
+        self.num_layers = 1  # Continuous RNN is always single-layer
+        self.dt = dt
+        self.tau = tau
+        self.g = g
+        self.nonlinearity = nonlinearity
+        self.learning_rate = learning_rate
+        self.n_epochs = n_epochs
+        self.batch_size = batch_size
+        self.verbose = verbose
+
+        if device is None:
+            if torch.cuda.is_available():
+                self.device = torch.device('cuda')
+            elif torch.backends.mps.is_available():
+                self.device = torch.device('mps')
+            else:
+                self.device = torch.device('cpu')
+        else:
+            self.device = torch.device(device)
+
+        self.model: Optional[ContinuousRNNNetwork] = None
+        self.train_losses: List[float] = []
+        self._is_fitted = False
+        self._input_size = None
+        self._is_sequence_output = False
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> 'TorchContinuousRNNRegressor':
+        """
+        Fit the continuous-time RNN model to training data.
+
+        Args:
+            X: Input sequences (n_samples, seq_len, n_features)
+            y: Target spike counts (n_samples, seq_len) or (n_samples,)
+
+        Returns:
+            self
+        """
+        if X.ndim == 2:
+            X = X[:, :, np.newaxis]
+
+        input_size = X.shape[2]
+        self._input_size = input_size
+        self._is_sequence_output = (y.ndim == 2)
+
+        # Z-score normalization
+        self.X_mean = np.mean(X, axis=(0, 1), keepdims=True)
+        self.X_std = np.std(X, axis=(0, 1), keepdims=True)
+        X_scaled = (X - self.X_mean) / (self.X_std + 1e-8)
+
+        # Initialize model
+        self.model = ContinuousRNNNetwork(
+            input_size=input_size,
+            hidden_size=self.hidden_dim,
+            dt=self.dt,
+            tau=self.tau,
+            g=self.g,
+            nonlinearity=self.nonlinearity,
+            init_scale=self.g  # Standard: g / sqrt(N) handled in _initialize_weights
+        ).to(self.device)
+
+        X_tensor = torch.FloatTensor(X_scaled).to(self.device)
+        y_tensor = torch.FloatTensor(y).to(self.device)
+
+        dataset = TensorDataset(X_tensor, y_tensor)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=5
+        )
+
+        self.train_losses = []
+        self.model.train()
+
+        for epoch in range(self.n_epochs):
+            epoch_loss = 0.0
+            for X_batch, y_batch in loader:
+                optimizer.zero_grad()
+
+                if self._is_sequence_output:
+                    y_pred = self.model(X_batch, return_sequence=True)
+                else:
+                    y_pred = self.model(X_batch, return_sequence=False)
+
+                # Poisson NLL loss
+                eps = 1e-8
+                loss = torch.mean(y_pred - y_batch * torch.log(y_pred + eps))
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+                epoch_loss += loss.item()
+
+            avg_loss = epoch_loss / len(loader)
+            self.train_losses.append(avg_loss)
+            scheduler.step(avg_loss)
+
+            if self.verbose and (epoch + 1) % max(1, self.n_epochs // 5) == 0:
+                print(f"    Epoch {epoch+1}/{self.n_epochs}, Loss: {avg_loss:.4f}")
+
+        self._is_fitted = True
+        return self
+
+    def predict_rate(self, X: np.ndarray, return_sequence: bool = False) -> np.ndarray:
+        """
+        Predict firing rates for input sequences.
+
+        Args:
+            X: Input sequences (n_samples, seq_len, n_features)
+            return_sequence: If True, return predictions for all timesteps
+
+        Returns:
+            Predicted firing rates
+        """
         if not self._is_fitted:
             raise RuntimeError("Model must be fitted before predicting")
 
