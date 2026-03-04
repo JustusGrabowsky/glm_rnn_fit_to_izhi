@@ -10,8 +10,8 @@ This script:
 6. Saves results to result_plots/<neuron_type>/
 
 Usage:
-    python run_all.py           # Run all neuron types
-    python run_all.py all       # Explicit all neuron types
+    python run_all.py           # Run default types (1, 2, 3, 4)
+    python run_all.py all       # Run all available neuron types
     python run_all.py 4         # Run single neuron type (e.g., phasic bursting)
     python run_all.py 1 2 3 4   # Run multiple specific neuron types
 """
@@ -26,7 +26,9 @@ from generate_izhikevich_stim import generate_izhikevich_stim
 from simulate_izhikevich import simulate_izhikevich
 from fit_glm import fit_glm
 from simulate_glm import simulate_glm
+from logexp1 import logexp1
 from rnn_models import TorchRNNRegressor, TorchVanillaRNNRegressor, TorchLSTMRegressor, TorchContinuousRNNRegressor
+from plrnn_models import TorchPLRNNRegressor
 from rnn_data_generator import RNNDataGenerator
 from izhikevich_configs import cids, index_to_name
 
@@ -78,18 +80,18 @@ TRAIN_ADVANCED_MODELS = True  # Whether to train advanced GRU variants
 ADVANCED_SPARSITY_WEIGHT = 10.0  # Weight for spike bins in weighted loss
 ADVANCED_SCHEDULED_SAMPLING_DECAY = 0.99  # Decay rate for scheduled sampling
 
-
-def logexp1(x):
-    """Numerically stable log(1 + exp(x))."""
-    return np.logaddexp(0, x)
+# PLRNN Configuration
+PLRNN_TAU = 10         # Teacher forcing interval
+PLRNN_N_BASES = 10     # Number of basis functions for dendPLRNN
+PLRNN_CLIP_RANGE = 10  # Clipping for stability
 
 
 # =============================================================================
 # Visualization Functions
 # =============================================================================
 
-def plot_training_data(X, y, save_path, n_examples=5, title="RNN Training Data"):
-    """Visualize training data samples with raw spike counts."""
+def plot_training_data(X, y, save_path, n_examples=5, title="RNN Training Data", smoothed=False):
+    """Visualize training data samples (raw spike counts or smoothed firing rates)."""
     fig, axes = plt.subplots(n_examples, 2, figsize=(14, 3 * n_examples))
     if n_examples == 1:
         axes = axes.reshape(1, -1)
@@ -108,57 +110,24 @@ def plot_training_data(X, y, save_path, n_examples=5, title="RNN Training Data")
         ax.grid(True, alpha=0.3)
 
         ax = axes[i, 1]
-        ax.bar(t, y[idx], width=1.0, color='k', alpha=0.7)
-        ax.set_ylabel('Spike count')
-        if i == 0:
-            ax.set_title('Target (spike counts)')
+        if smoothed:
+            ax.plot(t, y[idx], 'r', linewidth=1.5)
+            ax.fill_between(t, 0, y[idx], alpha=0.3, color='r')
+            ax.set_ylabel('Smoothed rate')
+            if i == 0:
+                ax.set_title('Target (smoothed firing rate)')
+            annotation = f'Trial {idx} (sum={y[idx].sum():.1f})'
+        else:
+            ax.bar(t, y[idx], width=1.0, color='k', alpha=0.7)
+            ax.set_ylabel('Spike count')
+            if i == 0:
+                ax.set_title('Target (spike counts)')
+            annotation = f'Trial {idx} ({y[idx].sum():.0f} spikes)'
         if i == n_examples - 1:
             ax.set_xlabel('Time (ms)')
         ax.grid(True, alpha=0.3)
 
-        n_spikes = y[idx].sum()
-        axes[i, 0].text(0.02, 0.95, f'Trial {idx} ({n_spikes:.0f} spikes)',
-                        transform=axes[i, 0].transAxes, fontsize=9, va='top')
-
-    fig.suptitle(title, fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved: {save_path}")
-
-
-def plot_smoothed_training_data(X, y_smoothed, save_path, n_examples=5,
-                                 title="RNN Training Data (Smoothed Targets)"):
-    """Visualize training data samples with smoothed firing rates."""
-    fig, axes = plt.subplots(n_examples, 2, figsize=(14, 3 * n_examples))
-    if n_examples == 1:
-        axes = axes.reshape(1, -1)
-
-    indices = np.random.choice(len(X), size=min(n_examples, len(X)), replace=False)
-
-    for i, idx in enumerate(indices):
-        ax = axes[i, 0]
-        t = np.arange(X.shape[1])
-        ax.plot(t, X[idx, :, 0], 'b', linewidth=1.5)
-        ax.set_ylabel('Current')
-        if i == 0:
-            ax.set_title('Stimulus (I)')
-        if i == n_examples - 1:
-            ax.set_xlabel('Time (ms)')
-        ax.grid(True, alpha=0.3)
-
-        ax = axes[i, 1]
-        ax.plot(t, y_smoothed[idx], 'r', linewidth=1.5)
-        ax.fill_between(t, 0, y_smoothed[idx], alpha=0.3, color='r')
-        ax.set_ylabel('Smoothed rate')
-        if i == 0:
-            ax.set_title('Target (smoothed firing rate)')
-        if i == n_examples - 1:
-            ax.set_xlabel('Time (ms)')
-        ax.grid(True, alpha=0.3)
-
-        total_rate = y_smoothed[idx].sum()
-        axes[i, 0].text(0.02, 0.95, f'Trial {idx} (sum={total_rate:.1f})',
+        axes[i, 0].text(0.02, 0.95, annotation,
                         transform=axes[i, 0].transAxes, fontsize=9, va='top')
 
     fig.suptitle(title, fontsize=14, fontweight='bold')
@@ -172,11 +141,15 @@ def plot_training_losses(train_losses_dict, save_path):
     """Plot training losses for base RNN models."""
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    colors = {'GRU': 'tab:blue', 'Vanilla RNN': 'tab:orange', 'LSTM': 'tab:green', 'CTRNN': 'tab:purple'}
+    colors = {
+        'GRU': 'tab:blue', 'Vanilla RNN': 'tab:orange', 'LSTM': 'tab:green', 'CTRNN': 'tab:purple',
+        'PLRNN': 'tab:red', 'dendPLRNN': 'tab:brown',
+    }
 
     for model_name, losses in train_losses_dict.items():
         epochs = np.arange(1, len(losses) + 1)
-        ax.plot(epochs, losses, color=colors[model_name], linewidth=2,
+        color = colors.get(model_name, 'gray')
+        ax.plot(epochs, losses, color=color, linewidth=2,
                 marker='o', markersize=4, label=model_name, alpha=0.8)
 
     ax.set_xlabel('Epoch')
@@ -215,6 +188,9 @@ def plot_training_losses_extended(train_losses_dict: Dict[str, List[float]], sav
         'GRU_ClosedLoop': 'tab:pink',
         'BiGRU': 'darkblue',
         'GRU_Attention': 'mediumvioletred',
+        # PLRNN models
+        'PLRNN': 'tab:red',
+        'dendPLRNN': 'tab:brown',
     }
 
     variant_styles = {
@@ -268,105 +244,130 @@ def plot_spike_raster_comparison(
     save_path: str,
     cell_name: str,
     cid: str,
+    y_glm: Optional[np.ndarray] = None,
+    dt_glm: Optional[float] = None,
     max_time_ms: float = 1500.0
 ):
     """
-    Create a comprehensive spike raster comparison plot.
+    Compact spike raster comparison: Izhikevich, GLM repeats, and all RNN models.
 
-    Shows Izhikevich ground truth and all RNN model predictions on clean step input.
-    Only shows the first portion of data (default: first 1500ms) for clarity.
+    All spike trains share a single axes for compact layout.
+    A 50ms scale bar is drawn in the stimulus panel.
 
     Args:
-        I_binned: Binned stimulus (for reference)
+        I_binned: Binned stimulus
         y_true: True binned spike counts
         all_predictions: Dict of model_name -> predicted rates
         rnn_bin_size_ms: RNN bin size in ms
         save_path: Path to save the plot
         cell_name: Cell type name for title
         cid: Cell ID for title
-        max_time_ms: Maximum time to display (default 1500ms, ~2 pulses)
+        y_glm: GLM spike trains (n_timesteps, n_runs); optional
+        dt_glm: GLM time step in ms; required if y_glm is provided
+        max_time_ms: Maximum time window to display
     """
-    # Limit data to first max_time_ms (for clearer visualization)
-    max_bins = int(max_time_ms / rnn_bin_size_ms)
-    max_bins = min(max_bins, len(I_binned))  # Don't exceed data length
+    max_bins = min(int(max_time_ms / rnn_bin_size_ms), len(I_binned))
+    t_rnn = np.arange(max_bins) * rnn_bin_size_ms
+    I_plot = I_binned[:max_bins]
+    y_plot = y_true[:max_bins]
+    preds_plot = {k: v[:max_bins] for k, v in all_predictions.items()}
 
-    I_binned = I_binned[:max_bins]
-    y_true = y_true[:max_bins]
-    all_predictions = {k: v[:max_bins] for k, v in all_predictions.items()}
+    n_glm = y_glm.shape[1] if y_glm is not None else 0
+    n_rows = 1 + n_glm + len(preds_plot)  # Izhi + GLM runs + RNN models
 
-    n_models = len(all_predictions) + 1  # +1 for ground truth
+    # Compact figure: fixed height per raster row
+    row_h_in = 0.18
+    stim_h_in = 1.2
+    fig_h = stim_h_in + n_rows * row_h_in + 0.6
 
-    fig, axes = plt.subplots(n_models + 1, 1, figsize=(14, 2 + 1.2 * n_models),
-                              sharex=True, gridspec_kw={'height_ratios': [1] + [1] * n_models})
+    fig = plt.figure(figsize=(14, fig_h))
+    gs = fig.add_gridspec(
+        2, 1,
+        height_ratios=[stim_h_in, n_rows * row_h_in],
+        hspace=0.05,
+        left=0.18, right=0.97,
+        top=1 - 0.25 / fig_h, bottom=0.45 / fig_h
+    )
+    ax_stim = fig.add_subplot(gs[0])
+    ax_raster = fig.add_subplot(gs[1])
 
-    t = np.arange(len(I_binned)) * rnn_bin_size_ms
+    # --- Stimulus panel ---
+    ax_stim.plot(t_rnn, I_plot, 'b', linewidth=1.5)
+    ax_stim.set_xlim([0, max_time_ms])
+    ax_stim.set_ylabel('I', fontsize=9)
+    ax_stim.set_title(f'{cell_name} ({cid}) — Spike Raster Comparison',
+                      fontsize=11, fontweight='bold')
+    ax_stim.set_xticks([])
+    ax_stim.spines['top'].set_visible(False)
+    ax_stim.spines['right'].set_visible(False)
+    ax_stim.spines['bottom'].set_visible(False)
 
-    # Panel 0: Stimulus
-    ax = axes[0]
-    ax.plot(t, I_binned, 'b', linewidth=1.5)
-    ax.set_ylabel('Current')
-    ax.set_title(f'{cell_name} ({cid}) - Spike Raster Comparison (First {max_time_ms:.0f}ms)', fontsize=12, fontweight='bold')
-    ax.grid(True, alpha=0.3)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
+    # 50ms scale bar (top-left of stimulus panel)
+    ymin_s, ymax_s = I_plot.min(), I_plot.max()
+    yr = ymax_s - ymin_s if ymax_s > ymin_s else 1.0
+    y_bar = ymax_s + 0.10 * yr
+    x_bar = 5.0
+    ax_stim.plot([x_bar, x_bar + 50], [y_bar, y_bar], 'k-', linewidth=2,
+                 solid_capstyle='butt', clip_on=False)
+    ax_stim.text(x_bar + 25, y_bar + 0.04 * yr, '50 ms',
+                 ha='center', va='bottom', fontsize=8, clip_on=False)
+    ax_stim.set_ylim([ymin_s - 0.05 * yr, ymax_s + 0.28 * yr])
 
-    # Panel 1: Ground truth (Izhikevich)
-    ax = axes[1]
-    spike_times = t[y_true > 0]
-    ax.eventplot([spike_times], colors=['k'], linewidths=1.5, linelengths=0.8)
-    ax.set_ylabel('Izhi', fontsize=10)
-    ax.set_yticks([])
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.spines['left'].set_visible(False)
-
-    # Define colors for model types (base models and advanced variants)
+    # --- Raster panel ---
     model_colors = {
-        # Base models
-        'GRU': 'tab:blue',
-        'Vanilla RNN': 'tab:orange',
-        'LSTM': 'tab:green',
-        'CTRNN': 'tab:purple',
-        # Advanced GRU models (different shades of blue/purple)
-        'GRU_Derivative': 'tab:cyan',
-        'GRU_Weighted': 'darkviolet',
-        'GRU_ClosedLoop': 'tab:pink',
-        'BiGRU': 'darkblue',
-        'GRU_Attention': 'mediumvioletred',
+        'GRU': 'tab:blue', 'Vanilla RNN': 'tab:orange', 'LSTM': 'tab:green',
+        'CTRNN': 'tab:purple', 'GRU_Derivative': 'tab:cyan', 'GRU_Weighted': 'darkviolet',
+        'GRU_ClosedLoop': 'tab:pink', 'BiGRU': 'darkblue', 'GRU_Attention': 'mediumvioletred',
+        'PLRNN': 'tab:red', 'dendPLRNN': 'tab:brown',
     }
 
-    # Remaining panels: Model predictions
-    for i, (model_name, pred) in enumerate(all_predictions.items()):
-        ax = axes[i + 2]
+    lh = 0.80  # spike line height (fraction of row spacing)
+    ytick_pos, ytick_lbl = [], []
+    row = 0
 
-        # Sample spikes from Poisson distribution
-        np.random.seed(42 + i)
-        sampled_spikes = np.random.poisson(np.clip(pred, 0, 10))
-        spike_times_model = t[sampled_spikes > 0]
+    # Row 0: Izhikevich ground truth
+    izhi_times = t_rnn[y_plot > 0]
+    ax_raster.eventplot([izhi_times], lineoffsets=[row], colors=['k'],
+                        linewidths=1.2, linelengths=lh)
+    ytick_pos.append(row); ytick_lbl.append('Izhikevich')
+    row += 1
 
-        # Get color based on model name (try exact match first, then base name)
-        if model_name in model_colors:
-            color = model_colors[model_name]
-        else:
-            # Fall back to base model name (for extended variants like "GRU (Smoothed)")
-            base_name = model_name.split(' (')[0]
-            color = model_colors.get(base_name, 'gray')
+    # GLM runs
+    if y_glm is not None and dt_glm is not None:
+        max_glm_idx = int(max_time_ms / dt_glm)
+        glm_gray = [0.5, 0.5, 0.5]
+        for i in range(y_glm.shape[1]):
+            g = y_glm[:min(max_glm_idx, len(y_glm)), i]
+            gtimes = np.where(g)[0] * dt_glm
+            ax_raster.eventplot([gtimes], lineoffsets=[row], colors=[glm_gray],
+                                linewidths=1.0, linelengths=lh)
+            ytick_pos.append(row); ytick_lbl.append(f'GLM {i + 1}')
+            row += 1
 
-        ax.eventplot([spike_times_model], colors=[color], linewidths=1.5, linelengths=0.8)
+    # RNN model predictions
+    for model_name, pred in preds_plot.items():
+        np.random.seed(42 + row)
+        sampled = np.random.poisson(np.clip(pred, 0, 10))
+        times = t_rnn[sampled > 0]
+        color = model_colors.get(model_name,
+                model_colors.get(model_name.split(' (')[0], 'gray'))
+        ax_raster.eventplot([times], lineoffsets=[row], colors=[color],
+                            linewidths=1.0, linelengths=lh)
+        ytick_pos.append(row)
+        ytick_lbl.append(model_name.replace('Vanilla RNN', 'V-RNN'))
+        row += 1
 
-        # Short label
-        label = model_name
-        if len(label) > 15:
-            label = label.replace('Vanilla RNN', 'V-RNN')
-        ax.set_ylabel(label, fontsize=8, rotation=0, ha='right', va='center')
-        ax.set_yticks([])
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-        ax.spines['left'].set_visible(False)
+    ax_raster.set_xlim([0, max_time_ms])
+    ax_raster.set_ylim([-0.5, row - 0.5])
+    ax_raster.invert_yaxis()
+    ax_raster.set_yticks(ytick_pos)
+    ax_raster.set_yticklabels(ytick_lbl, fontsize=8)
+    ax_raster.set_xlabel('Time (ms)', fontsize=10)
+    ax_raster.spines['top'].set_visible(False)
+    ax_raster.spines['right'].set_visible(False)
+    ax_raster.spines['left'].set_visible(False)
+    ax_raster.tick_params(left=False)
 
-    axes[-1].set_xlabel('Time (ms)', fontsize=11)
-
-    plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"  Saved: {save_path}")
@@ -374,16 +375,16 @@ def plot_spike_raster_comparison(
 
 def plot_comparison(
     cell_type, I_iz, spikes, v, dt, k, h, dc,
-    rnn_models, rnn_predictions_binned, rnn_bin_size_ms,
+    y_glm, stimcurr, hcurr,
     soft_rect=0, save_dir='plots'
 ):
     """
-    Create comprehensive comparison plot of GLM + RNN vs Izhikevich neuron.
+    Create GLM-focused comparison plot vs Izhikevich ground truth.
 
     Shows:
     - Left: Time series (stimulus, voltage, filter outputs, conditional intensity, spike rasters)
     - Right: Filters (k, h)
-    - Spike rasters include: Izhikevich, 5 GLM runs, 4 RNN models (base only)
+    - Spike rasters include: Izhikevich ground truth + GLM repeats only
     """
     # Time windows for each cell type
     Ts = np.array([
@@ -397,9 +398,6 @@ def plot_comparison(
     cid = cids[cid_idx]
 
     NL = logexp1 if soft_rect else np.exp
-
-    # Simulate GLM
-    y_glm, stimcurr, hcurr, r = simulate_glm(I_iz, dt, k, h, dc, GLM_N_RUNS, soft_rect, plotFlag=0)
 
     # Setup time indices
     minT = max(Ts[cid_idx, 0], 1)
@@ -416,11 +414,10 @@ def plot_comparison(
     axisWidth = 1
     izColor = 'k'
     glmColor = [0.5, 0.5, 0.5]
-    rnnColors = {'GRU': 'tab:blue', 'Vanilla RNN': 'tab:orange', 'LSTM': 'tab:green', 'CTRNN': 'tab:purple'}
 
     cell_name = index_to_name.get(cell_type, f"Cell {cell_type}")
     fig = plt.figure(figsize=(12, 14))
-    fig.suptitle(f'{cell_name} - GLM + RNN vs Izhikevich', fontsize=14, fontweight='bold', y=0.995)
+    fig.suptitle(f'{cell_name} - GLM vs Izhikevich', fontsize=14, fontweight='bold', y=0.995)
 
     # ==========================================================================
     # RIGHT SIDE: Filters
@@ -556,27 +553,6 @@ def plot_comparison(
 
     row_idx = GLM_N_RUNS
 
-    # Plot RNN spikes (base models only)
-    minT_bin = int(minT / rnn_bin_size_ms)
-    maxT_bin = int(maxT / rnn_bin_size_ms)
-    rnn_tIdx = np.arange(minT_bin, min(maxT_bin + 1, len(list(rnn_predictions_binned.values())[0])))
-
-    for model_name in ['GRU', 'Vanilla RNN', 'LSTM', 'CTRNN']:
-        if model_name in rnn_predictions_binned:
-            pred = rnn_predictions_binned[model_name]
-            # Sample spikes from Poisson
-            np.random.seed(42 + row_idx)
-            pred_slice = pred[rnn_tIdx] if len(rnn_tIdx) > 0 else pred
-            sampled_spikes = np.random.poisson(np.clip(pred_slice, 0, 10))
-            spt = np.where(sampled_spikes > 0)[0]
-            y_base = row_idx + 0.5
-
-            for spike_idx in spt:
-                time_ms = spike_idx * rnn_bin_size_ms
-                ax5.plot([time_ms, time_ms], [y_base, y_base + spikeHeight],
-                        color=rnnColors[model_name], linewidth=1.2)
-            row_idx += 1
-
     # Plot Izhikevich spikes (top)
     spikes_slice = spikes[tIdx]
     spt_iz = np.where(spikes_slice)[0]
@@ -598,11 +574,7 @@ def plot_comparison(
     from matplotlib.lines import Line2D
     legend_elements = [
         Line2D([0], [0], color=izColor, linewidth=2, label='Izhikevich'),
-        Line2D([0], [0], color=rnnColors['CTRNN'], linewidth=2, label='CTRNN'),
-        Line2D([0], [0], color=rnnColors['LSTM'], linewidth=2, label='LSTM'),
-        Line2D([0], [0], color=rnnColors['Vanilla RNN'], linewidth=2, label='Vanilla RNN'),
-        Line2D([0], [0], color=rnnColors['GRU'], linewidth=2, label='GRU'),
-        Line2D([0], [0], color=glmColor, linewidth=2, label='GLM repeats')
+        Line2D([0], [0], color=glmColor, linewidth=2, label=f'GLM ({GLM_N_RUNS} repeats)'),
     ]
     ax5.legend(handles=legend_elements, loc='upper right', fontsize=9, frameon=False)
 
@@ -671,6 +643,34 @@ def train_base_rnn_models(
                                         batch_size=32, learning_rate=0.001, verbose=verbose)
     ctrnn.fit(X_train, y_train)
     rnn_models['CTRNN'] = ctrnn
+
+    if verbose:
+        print("\n  Training Standard PLRNN...")
+    plrnn = TorchPLRNNRegressor(
+        hidden_dim=RNN_HIDDEN_DIM,
+        n_bases=0,
+        tau=PLRNN_TAU,
+        n_epochs=RNN_N_EPOCHS,
+        batch_size=32,
+        clip_range=PLRNN_CLIP_RANGE,
+        verbose=verbose
+    )
+    plrnn.fit(X_train, y_train)
+    rnn_models['PLRNN'] = plrnn
+
+    if verbose:
+        print("\n  Training Dendritic PLRNN...")
+    dend_plrnn = TorchPLRNNRegressor(
+        hidden_dim=RNN_HIDDEN_DIM,
+        n_bases=PLRNN_N_BASES,
+        tau=PLRNN_TAU,
+        n_epochs=RNN_N_EPOCHS,
+        batch_size=32,
+        clip_range=PLRNN_CLIP_RANGE,
+        verbose=verbose
+    )
+    dend_plrnn.fit(X_train, y_train)
+    rnn_models['dendPLRNN'] = dend_plrnn
 
     return rnn_models
 
@@ -1024,6 +1024,8 @@ def run_pipeline(cellType: int, results_dir: str = 'result_plots', verbose: bool
         'GRU': rnn_models['GRU'].train_losses,
         'Vanilla RNN': rnn_models['Vanilla RNN'].train_losses,
         'LSTM': rnn_models['LSTM'].train_losses,
+        'PLRNN': rnn_models['PLRNN'].train_losses,
+        'dendPLRNN': rnn_models['dendPLRNN'].train_losses,
     }
 
     # Plot base training losses
@@ -1052,8 +1054,9 @@ def run_pipeline(cellType: int, results_dir: str = 'result_plots', verbose: bool
 
             # Save smoothed training data plot
             smoothed_data_plot = os.path.join(output_dir, 'rnn_training_data_smoothed.png')
-            plot_smoothed_training_data(X_train, y_smoothed, smoothed_data_plot, n_examples=5,
-                                        title=f'{neuron_name} - RNN Training Data (Smoothed, σ={RNN_SMOOTH_SIGMA_MS}ms)')
+            plot_training_data(X_train, y_smoothed, smoothed_data_plot, n_examples=5,
+                               title=f'{neuron_name} - RNN Training Data (Smoothed, σ={RNN_SMOOTH_SIGMA_MS}ms)',
+                               smoothed=True)
 
             # Plot extended training losses
             extended_losses_plot = os.path.join(output_dir, 'rnn_training_losses_extended.png')
@@ -1094,10 +1097,13 @@ def run_pipeline(cellType: int, results_dir: str = 'result_plots', verbose: bool
             print(f"\n[5/7] Skipping advanced GRU models (disabled)")
 
     # ==========================================================================
-    # STEP 6: Evaluate RNNs on EXACT same stimulus as GLM
+    # STEP 6: Simulate GLM and evaluate RNNs on EXACT same stimulus
     # ==========================================================================
     if verbose:
-        print(f"\n[6/7] Evaluating RNNs on GLM stimulus...")
+        print(f"\n[6/7] Simulating GLM and evaluating RNNs on GLM stimulus...")
+
+    # Pre-compute GLM output once (reused by both plot functions)
+    y_glm, stimcurr, hcurr, _ = simulate_glm(I, dt, k, h, dc, GLM_N_RUNS, softRect, plotFlag=0)
 
     # Bin the GLM stimulus for RNN evaluation
     samples_per_bin = int(RNN_BIN_SIZE_MS / dt)
@@ -1176,10 +1182,10 @@ def run_pipeline(cellType: int, results_dir: str = 'result_plots', verbose: bool
     if verbose:
         print(f"\n[7/7] Creating comparison plots...")
 
-    # Main comparison plot (with base RNNs only)
+    # Main GLM-focused comparison plot
     plot_comparison(
         cellType, I, spikes, v, dt, k, h, dc,
-        rnn_models, rnn_predictions, RNN_BIN_SIZE_MS,
+        y_glm, stimcurr, hcurr,
         soft_rect=softRect, save_dir=output_dir
     )
 
@@ -1190,7 +1196,8 @@ def run_pipeline(cellType: int, results_dir: str = 'result_plots', verbose: bool
         raster_plot = os.path.join(output_dir, 'spike_raster_comparison.png')
         plot_spike_raster_comparison(
             I_binned, y_binned, all_predictions, RNN_BIN_SIZE_MS,
-            raster_plot, cell_name, cid
+            raster_plot, cell_name, cid,
+            y_glm=y_glm, dt_glm=dt
         )
 
         # Also plot the combined training losses
@@ -1284,7 +1291,7 @@ if __name__ == '__main__':
 
     if len(sys.argv) > 1:
         if sys.argv[1].lower() == 'all':
-            # Explicit 'all' argument
+            # Explicit 'all': run every available neuron type
             run_all(results_dir)
         elif len(sys.argv) > 2:
             # Multiple neuron types: python run_all.py 1 2 3 4
@@ -1321,5 +1328,10 @@ if __name__ == '__main__':
             cellType = int(sys.argv[1])
             run_pipeline(cellType, results_dir)
     else:
-        # Default: run all neuron types
-        run_all(results_dir)
+        # Default: run types 1, 2, 3, 4
+        default_types = [1, 2, 3, 4]
+        print(f"\nRunning default neuron types: {default_types}")
+        print(f"(Pass 'all' to run all {len(NEURON_TYPES)} available types)")
+        print(f"Results will be saved to: {results_dir}")
+        for cellType in default_types:
+            run_pipeline(cellType, results_dir=results_dir, verbose=True)
